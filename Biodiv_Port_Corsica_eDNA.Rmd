@@ -1,0 +1,733 @@
+---
+title: "Biodiv_Port_Corsica_eDNA"
+author: "Rachel Haderlé"
+date: "2024-10-24"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+##Beta-diversity
+```{r}
+## Load necessary libraries and data imports
+library(readxl)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(ape)
+library(adespatial)
+library(vegan)
+library(factoextra)
+library("sf")
+library("rnaturalearth")
+library("rnaturalearthdata")
+library("ggspatial")
+library(tidyselect)
+library(raster)
+library(VennDiagram)
+library(viridis)
+library(reshape2)
+library(fastDummies)
+library(fishtree)
+library(picante)
+library(geiger)
+loadNamespace("rfishbase") # Ensures functions from rfishbase are loaded
+library(rtrees)
+library(taxize)
+library(cluster)
+library(tibble)
+
+## Beta diversity: Jaccard dissimilarity and turnover/nestedness calculations
+
+# Import occurrence data
+occurrences <- read.csv("occ_data.csv")
+
+# Convert the data into a presence-absence matrix (1 = present, 0 = absent)
+adne <- dcast(occurrences, Taxonomie ~ Station, value.var = "Taxonomie", fun.aggregate = length)
+
+# Identify columns to modify (all except 'Taxonomie')
+columns_to_modify <- setdiff(colnames(adne), "Taxonomie")
+
+# Apply binary conversion to the selected columns (1 if present, 0 otherwise)
+adne[columns_to_modify] <- lapply(adne[columns_to_modify], function(x) ifelse(x > 0, 1, x))
+
+# Save the presence-absence matrix to a CSV file
+write.csv(adne, "adne.csv", row.names = FALSE)
+
+# Read the generated presence-absence matrix and transpose it for further analysis
+jaccard <- read.csv("adne.csv", header = TRUE, row.names = 1)
+jaccard <- t(jaccard)
+
+# Convert all elements to numeric format
+jaccard[] <- apply(jaccard, c(1, 2), as.numeric)
+
+# Perform Jaccard dissimilarity analysis using binary (presence-absence) data
+JAC <- beta.div.comp(jaccard, quant = FALSE, save.abc = FALSE)
+JAC
+
+# Retrieve the dissimilarity matrix (Jaccard distances)
+JAC$D
+
+## Heatmap of Jaccard dissimilarities
+
+# Convert the Jaccard distance matrix into a dataframe for visualization
+jaccard_matrix <- as.data.frame(as.table(as.matrix(JAC$D)))
+colnames(jaccard_matrix) <- c("Station1", "Station2", "Distance")
+
+# Replace "_Autumn" with "_PS" (for post-storm) in the station names
+jaccard_matrix$Station1 <- gsub("_Autumn", "_PS", jaccard_matrix$Station1)
+jaccard_matrix$Station2 <- gsub("_Autumn", "_PS", jaccard_matrix$Station2)
+
+# Create a heatmap with a reversed purple color palette (0 = white, 1 = dark purple)
+ggplot(jaccard_matrix, aes(x = Station1, y = Station2, fill = Distance)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(
+    option = "magma",    # Use the 'magma' purple color palette
+    limits = c(0, 1),    # Set the limits for the color scale
+    name = "Dissimilarity\n(Jaccard Distance)",
+    direction = -1       # Reverse the scale: low values are light, high values are dark
+  ) +
+  labs(x = NULL, y = NULL) +  # Remove axis labels
+  theme_minimal() +            # Use a minimalistic theme
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),   # Rotate x-axis labels
+    plot.title = element_text(hjust = 0.5),              # Center the plot title
+    plot.subtitle = element_text(hjust = 0.5)            # Center the plot subtitle
+  )
+
+## Pairwise turnover/nestedness table
+
+# Define station names (using consistent naming)
+stations <- c("Calvi_Autumn", "Calvi_Spring", "L.Île.Rousse_Autumn", "L.Île.Rousse_Spring",
+              "Saint.Florent_Autumn", "Saint.Florent_Spring", "STARESO_Autumn", "STARESO_Spring")
+
+# Initialize an empty list to store results for each station pair
+results <- list()
+
+# Calculate Jaccard dissimilarity for each pair of stations
+for (i in 1:(length(stations) - 1)) {
+  for (j in (i + 1):length(stations)) {
+    # Exclude rows and columns of stations not being compared
+    jaccard_subset <- jaccard[-c(i, j), -c(i, j)]
+    JAC <- beta.div.comp(jaccard_subset, quant = FALSE, save.abc = FALSE)
+    
+    # Save BDtotal and RichDif values for each pair of stations
+    results[[paste(stations[i], stations[j], sep = ", ")]] <- c(JAC$part[4], JAC$part[5])
+  }
+}
+
+# Create a results matrix to store turnover/nestedness results
+results_matrix <- matrix(NA, nrow = length(stations), ncol = length(stations))
+rownames(results_matrix) <- stations
+colnames(results_matrix) <- stations
+
+# Fill the matrix with BDtotal (top half) and RichDif (bottom half) values
+for (i in 1:length(stations)) {
+  for (j in 1:length(stations)) {
+    if (i < j) {
+      results_matrix[i, j] <- results[[paste(stations[i], stations[j], sep = ", ")]][1]  # BDtotal
+    } else if (i > j) {
+      results_matrix[i, j] <- results[[paste(stations[j], stations[i], sep = ", ")]][2]  # RichDif
+    }
+  }
+}
+
+# Convert the matrix to a dataframe for readability
+results_df <- as.data.frame(results_matrix)
+
+# Round values to 2 decimal places and export to a CSV file
+write.csv(format(round(results_df, 2), nsmall = 2), file = "resultats_jaccard.csv", row.names = TRUE)
+
+# Display the final table
+print(results_df)
+
+```
+
+#################################################################################
+##Biodiversity indicators (inspired by Dalongeville et al., 2022 https://doi.org/10.1111/1365-2664.14276)
+
+Load biodiversity data and calculate presence-absence matrix
+```{r}
+library(reshape2)
+
+# Load the occurrence data from a CSV file
+occurrences <- read.csv("occ_data.csv")
+
+# Convert the data into a presence-absence matrix (1 if present, 0 otherwise)
+adne <- dcast(occurrences, Taxonomie ~ Station, value.var = "Taxonomie", fun.aggregate = length)
+
+# Identify columns to modify (all except "Taxonomie")
+columns_to_modify <- setdiff(colnames(adne), "Taxonomie")
+
+# Convert the selected columns to binary (1 if present, 0 otherwise)
+adne[columns_to_modify] <- lapply(adne[columns_to_modify], function(x) ifelse(x > 0, 1, x))
+
+# Save the presence-absence matrix to a CSV file
+write.csv(adne, "adne.csv", row.names = FALSE)
+```
+
+
+Load eDNA data and filter the species list
+```{r}
+## Load the eDNA data (matrix of species by sample)
+adne <- read.csv("adne.csv", row.names = 1)
+
+# Extract the list of species and samples
+species <- rownames(adne)
+samples <- colnames(adne)
+
+# Load the species data again
+adnei <- read.csv("adne.csv", header = TRUE)
+
+# Filter species names that are too generic (e.g., "sp.") or only include family names
+species_list <- adnei$Taxonomie
+species_list <- adnei[!grepl("\\bsp\\.\\b", sapply(strsplit(as.character(species_list), " "), `[`, 2)) & 
+                      sapply(strsplit(as.character(species_list), " "), length) > 1, ]
+
+# Keep the filtered species names
+species_list <- species_list$Taxonomie
+
+# Check the filtered species names
+head(species_list)
+
+# Save the filtered species list
+write.csv(species_list, file = "species_list.csv", row.names = FALSE)
+```
+
+Use OpenRefine for IUCN status and invasive species, then merge with traits data
+```{r}
+# Load species data from OpenRefine with IUCN status and invasive species information
+species_list_open <- read.csv2("species_list_open.csv", header = TRUE)
+
+# Rename columns for clarity
+species_list_open <- species_list_open %>%
+  rename(Species = x, IUCN_status = IUCN.conservation.status, invasive = invasive.to)
+
+# Retrieve traits information from FishBase using the species list
+traits_bruts <- rfishbase::species(species_list = species_list, fields = c("Species", "CommonLength", "Vulnerability", "DemersPelag", "Importance"))
+
+# Get trophic level data from FishBase
+trophic_data <- rfishbase::ecology(species_list, fields = c("Species", "FoodTroph"))
+traits_bruts <- merge(traits_bruts, trophic_data[, c("Species", "FoodTroph")], by = "Species", all.x = TRUE)
+
+# Merge FishBase traits with IUCN status data
+traits_bruts <- traits_bruts %>%
+  left_join(species_list_open, by = "Species")
+
+# Save the merged traits and IUCN status data
+write.csv(traits_bruts, file = "traits_bruts.csv", row.names = FALSE)
+
+# Preview the first rows of the merged data
+head(traits_bruts)
+```
+
+Combine species traits with eDNA data
+```{r}
+# Load the updated traits data
+traits_bruts <- read.csv("traits_bruts.csv", header = TRUE)
+
+# Load the original occurrence data
+adnei <- read.csv("adne.csv", header = TRUE)
+
+# Merge the occurrence data with species traits
+adnei_with_traits <- merge(adnei, traits_bruts, by.x = "Taxonomie", by.y = "Species", all = TRUE)
+
+# Save the merged data
+write.csv(adnei_with_traits, file = "adnei_with_traits.csv", row.names = FALSE)
+```
+
+
+Perform biodiversity indicator calculations
+```{r}
+# Load the merged data with traits and replace NA values with 0 (except in 'Vulnerability')
+adnei_with_traits <- read.csv("adnei_with_traits.csv", header = TRUE)
+
+# Mark invasive species (binary: 1 for invasive, 0 otherwise)
+adnei_with_traits <- adnei_with_traits %>%
+  mutate(Invasive = ifelse(invasive == "1", 1, 0))
+adnei_with_traits$Invasive[is.na(adnei_with_traits$Invasive)] <- 0
+
+# Add columns for different IUCN categories
+adnei_with_traits <- adnei_with_traits %>%
+  mutate(
+    IUCN_Red_List_Category_VU = ifelse(IUCN_status == "Vulnerable", 1, 0),
+    IUCN_Red_List_Category_EN = ifelse(IUCN_status == "Endangered", 2, 0),
+    IUCN_Red_List_Category_CR = ifelse(IUCN_status == "Critically Endangered", 3, 0)
+  )
+
+# Save the updated dataset
+write.csv(adnei_with_traits, file = "adnei_with_traits_updated.csv", row.names = FALSE)
+
+# Display the first few rows of the updated dataset
+print(head(adnei_with_traits))
+```
+
+Create the indicators table
+```{r}
+# Create the result matrix for biodiversity indicators
+indicators <- matrix(NA, ncol(adne), 9,
+                     dimnames = list(colnames(adne),
+                                     c("R", "PD", "PD/SR", "FD", "FD/R", "Vulner", "RedList", "TLmean", "Invasive")))
+```
+
+###Taxonomic richness
+```{r}
+indicators[,1] <- apply(adne, 2, sum)
+```
+
+###Functional Diversity
+To calculate functional diversity (FD), we first retrieve species traits from FishBase, perform clustering using PCoA, and map them to MOTUs (Molecular Operational Taxonomic Units).
+```{r}
+# List of probable species from FishBase
+fish_species <- species_list
+
+# Retrieve trait data for each species from FishBase
+all_traits_list <- rfishbase::species(species_list = fish_species, 
+                                      fields = c("Species", "CommonLength", "Weight", "LongevityWild", 
+                                                 "AnaCat", "MigratRef", "DepthRangeShallow", "DepthRangeDeep"))
+
+# Convert the retrieved list to a data frame
+traits_data <- as.data.frame(all_traits_list)
+
+# Select the relevant columns for analysis
+traits_subset <- traits_data %>%
+  dplyr::select(Species, CommonLength, Weight, LongevityWild, AnaCat, 
+                MigratRef, DepthRangeShallow, DepthRangeDeep)
+
+# Select only the numeric columns for further processing
+numeric_columns <- c("CommonLength", "Weight", "LongevityWild", "DepthRangeShallow", "DepthRangeDeep")
+
+# Replace missing values in numeric columns with the median of each column
+for (col in numeric_columns) {
+  traits_subset[[col]][is.na(traits_subset[[col]])] <- median(traits_subset[[col]], na.rm = TRUE)
+}
+
+# Convert categorical variables to factors if needed
+traits_subset$AnaCat <- as.factor(traits_subset$AnaCat)
+traits_subset$MigratRef <- as.factor(traits_subset$MigratRef)
+
+# Calculate trait dissimilarity using Gower's distance
+gower_dist <- daisy(traits_subset[, -1], metric = "gower")
+
+# Print the dissimilarity matrix (optional)
+print(gower_dist)
+
+# Perform Principal Coordinate Analysis (PCoA) on the dissimilarity matrix
+pcoa_result <- pcoa(gower_dist)
+
+# Extract the PCoA scores (coordinates of species in PCoA space)
+pcoa_scores <- as.data.frame(pcoa_result$vectors)
+
+# Set species names as row names
+rownames(pcoa_scores) <- traits_subset$Species
+
+# Select the first two PCoA axes for analysis
+pcoa_scores <- pcoa_scores[, 1:2]
+
+# Function to calculate functional diversity (variation in trait space)
+functional_diversity <- function(x) {
+  sqrt(sum((x - mean(x))^2))
+}
+
+# Calculate functional diversity for each species using the first two PCoA axes
+diversity_scores <- apply(pcoa_scores, 1, functional_diversity)
+
+# Round the functional diversity scores to 5 decimal places
+diversity_scores <- round(diversity_scores, digits = 5)
+
+# Create a data frame with species names and their corresponding functional diversity scores
+diversity_results <- data.frame(Species = rownames(pcoa_scores), FunctionalDiversity = diversity_scores)
+
+# Display the functional diversity results (optional)
+print(diversity_results)
+
+# Load the species occurrence data (adne dataset)
+adnei <- read.csv("occ_data.csv", header = TRUE)
+
+# Merge the occurrence data (adne) with the functional diversity results based on the species (Taxonomy)
+traits_updated <- merge(adnei, diversity_results, by.x = "Taxonomie", by.y = "Species", all = TRUE)
+
+# Rename the functional diversity column to "GF" (Functional Group)
+colnames(traits_updated)[colnames(traits_updated) == "FunctionalDiversity"] <- "GF"
+
+# Replace NA values in the "GF" column with 0 (indicating no functional group assigned)
+traits_updated <- traits_updated %>%
+  dplyr::mutate(GF = replace(GF, is.na(GF), 0))
+
+# Save the updated data to a CSV file
+write.csv(traits_updated, file="traits_updated.csv")
+```
+
+For each sample, the functional diversity is calculated based on the number of unique functional groups.
+```{r}
+# Calculate the functional diversity (FD) indicator for each sample
+for (i in 1:ncol(adne)) { 
+  # List the species present in the sample
+  s_i <- adne %>%
+    filter(adne[,i] == 1) %>%
+    tibble::rownames_to_column(var="Sp") %>%
+    pull(Sp)
+  
+  # Retrieve the functional groups (GF) of the species present
+  fd_i <- as.factor(traits_updated[traits_updated$Taxonomie %in% s_i, "GF"])
+  
+  # Count the number of unique functional groups and store it in the indicators dataframe
+  indicators[i, "FD"] <- length(unique(fd_i))
+}
+
+# (Optional) Normalize the FD indicator by species richness (R) for each sample
+indicators[, "FD/R"] <- indicators[, "FD"]/indicators[, "R"]
+```
+
+###Invasive species
+```{r}
+# Loop to calculate the invasive species indicator for each sample
+for (i in 1:nrow(indicators)) { 
+  # List the species present in the sample
+  s_i <- adne %>%
+    filter(adne[,i] == 1) %>%
+    tibble::rownames_to_column(var="Sp") %>%
+    pull(Sp)
+  
+  # Sum the number of invasive species in the sample and store the result in the indicators dataframe
+  indicators[i, "Invasive"] <- sum(adnei_with_traits[which(adnei_with_traits$Taxonomie %in% s_i), "Invasive"])
+}
+```
+
+###TLmean
+```{r}
+# Calculate mean trophic level (TLmean) for each sample
+for (i in 1:nrow(indicators)) {  # Loop through each sample
+  # List species present in the sample
+  s_i <- adne %>%
+    filter(adne[, i] == 1) %>%
+    tibble::rownames_to_column(var = "Sp") %>%
+    pull(Sp)
+
+  # Calculate mean trophic level
+  indicators[i, "TLmean"] <- mean(adnei_with_traits[which(adnei_with_traits$Taxonomie %in% s_i), "FoodTroph"], na.rm = TRUE)
+}
+
+# Calculate mean and standard deviation for TLmean with formatted output
+for (i in 1:nrow(indicators)) {
+  # List species present in the sample
+  s_i <- adne %>%
+    filter(adne[, i] == 1) %>%
+    tibble::rownames_to_column(var = "Sp") %>%
+    pull(Sp)
+
+  # Calculate mean and standard deviation for TLmean
+  tl_values <- adnei_with_traits[which(adnei_with_traits$Taxonomie %in% s_i), "FoodTroph"]
+  tl_mean <- mean(tl_values, na.rm = TRUE)
+  tl_sd <- sd(tl_values, na.rm = TRUE)
+
+  # Store formatted value with mean and standard deviation
+  indicators[i, "TLmean"] <- sprintf("%.2f (± %.2f)", tl_mean, tl_sd)
+}
+```
+
+###Vulnerability
+```{r}
+# Calculate vulnerability indicator for each sample
+for (i in 1:nrow(indicators)) {  # Loop through each sample
+  # List species present in the sample
+  s_i <- adne %>%
+    filter(adne[, i] == 1) %>%
+    tibble::rownames_to_column(var = "Sp") %>%
+    pull(Sp)
+
+  # Calculate mean vulnerability for the species present
+  indicators[i, "Vulner"] <- mean(adnei_with_traits[which(adnei_with_traits$Taxonomie %in% s_i), "Vulnerability"], na.rm = TRUE)
+}
+
+```
+
+###IUCN Status
+```{r}
+# Calculate the number of species in each IUCN category for each sample
+for (i in 1:nrow(indicators)) {  # Loop through each sample
+  # List species present in the sample
+  s_i <- adne %>%
+    filter(adne[, i] == 1) %>%
+    tibble::rownames_to_column(var = "Sp") %>%
+    pull(Sp)
+
+  # Count species in Vulnerable (VU), Endangered (EN), and Critically Endangered (CR) categories
+  VU <- sum(adnei_with_traits[which(adnei_with_traits$Taxonomie %in% s_i), "IUCN_Red_List_Category_VU"], na.rm = TRUE)
+  EN <- sum(adnei_with_traits[which(adnei_with_traits$Taxonomie %in% s_i), "IUCN_Red_List_Category_EN"], na.rm = TRUE)
+  CR <- sum(adnei_with_traits[which(adnei_with_traits$Taxonomie %in% s_i), "IUCN_Red_List_Category_CR"], na.rm = TRUE)
+
+  # Calculate total number of species in Red List categories
+  indicators[i, "RedList"] <- (VU + EN + CR)
+}
+
+```
+
+###Phylogenetic Diversity of Fish
+
+```{r}
+
+# Read the dataset
+test <- read.csv("adne.csv", header = TRUE)
+
+# Replace spaces with underscores in the species column
+test$Taxonomie <- gsub(" ", "_", test$Taxonomie)
+
+# Create a tibble for the species list
+test_fish_list <- tibble::tibble(
+  species = test$Taxonomie,
+  genus = test$Genus,
+  family = test$Family,
+  order = test$Order
+)
+
+# Retrieve the phylogenetic tree for fish species
+phy2 <- get_tree(sp_list = test_fish_list,
+                 taxon = "fish",
+                 scenario = "at_basal_node",
+                 show_grafted = TRUE)
+
+# Specify species to exclude from the tree
+data_not_tree <- c("Mobula_mobular", "Sparidae")
+
+# Read occurrence data
+adne <- read.csv("adne.csv", header = TRUE, row.names = 1)
+rownames(adne) <- gsub(" ", "_", rownames(adne))
+
+# Filter out species not in the phylogenetic tree
+adne2 <- adne[!rownames(adne) %in% data_not_tree, ]
+
+# Check species names in adne2 against the phylogenetic tree
+phy_labels <- phy2$tip.label
+adne_labels <- rownames(adne2)
+
+# Identify species present in adne2 but not in phy2
+not_in_phy2 <- setdiff(adne_labels, phy_labels)
+# Identify species present in phy2 but not in adne2
+not_in_adne2 <- setdiff(phy_labels, adne_labels)
+
+# Print species names in the phylogenetic tree
+print(phy2$tip.label)
+
+# Remove asterisks from species names in phy2
+phy2$tip.label <- gsub("\\*", "", phy2$tip.label)
+
+# Check modified species names
+print(phy2$tip.label)
+
+# Identify species to remove from the phylogenetic tree
+missing_from_tree <- setdiff(adne_labels, phy_labels)
+# Prune the tree to remove specified species
+prunedTree <- drop.tip(phy2, missing_from_tree)
+
+# Check the structure of the pruned tree
+print(prunedTree)
+
+# Filter adne2 to keep only species present in prunedTree
+adne2_filtered <- adne2[rownames(adne2) %in% prunedTree$tip.label, ]
+
+# Check the dimensions of adne2_filtered
+print(dim(adne2_filtered))
+
+# Transpose the ADNe matrix
+adne2_filtered <- t(adne2_filtered)
+
+# Calculate Faith's PD
+pd.result <- picante::pd(adne2_filtered, prunedTree, include.root = TRUE)
+
+# Check the results of PD calculation
+print(pd.result)
+
+# Store the PD values in the indicators dataframe
+indicators[, "PD"] <- pd.result$PD
+
+# Calculate the ratio of PD to species richness (SR)
+indicators[, "PD/SR"] <- pd.result$PD / pd.result$SR
+
+```
+
+```{r}
+write.csv(indicators, file="indicators_updated.csv")
+```
+
+################################################################################
+##Jaccard and dissimilarity with functional group values.
+```{r}
+# Load the CSV file containing the occurrences
+occurrences <- read.csv("traits_updated.csv")
+
+# Load necessary libraries
+library(reshape2)
+
+# Create a presence-absence (PA) matrix
+PA_matrix <- dcast(occurrences, Station ~ GF, fun.aggregate = length, value.var = "GF")
+
+# Convert counts to presence-absence (1 if present, 0 otherwise)
+PA_matrix[,-1] <- lapply(PA_matrix[,-1], function(x) ifelse(x > 0, 1, 0))
+
+# Ensure that the columns are numeric
+PA_matrix[-1] <- lapply(PA_matrix[-1], as.numeric)
+
+# Define row names for the PA matrix using the Station column
+row.names(PA_matrix) <- PA_matrix$Station
+
+# Remove the Station column now that we have defined the row names
+PA_matrix <- PA_matrix[,-1]
+
+# Check the structure of the PA matrix
+str(PA_matrix)
+
+# Calculate beta diversity using Jaccard index
+jacfd <- beta.div.comp(as.matrix(PA_matrix), quant = FALSE, save.abc = FALSE)
+
+# Print the results
+print(jacfd)
+
+# List of stations to compare
+stations <- c("Calvi_Autumn", "Calvi_Spring", "L.Île.Rousse_Autumn", "L.Île.Rousse_Spring",
+              "Saint.Florent_Autumn", "Saint.Florent_Spring", "STARESO_Autumn", "STARESO_Spring")
+
+# Create a list to store results for each pair of stations
+results <- list()
+
+# Calculate Jaccard index for each pair of stations
+for (i in 1:(length(stations) - 1)) {
+  for (j in (i + 1):length(stations)) {
+    # Exclude rows and columns of non-compared stations
+    jaccard_subset <- PA_matrix[-c(i, j), -c(i, j)]
+    JAC <- beta.div.comp(as.matrix(jaccard_subset), quant = FALSE, save.abc = FALSE)
+    
+    # Store BDtotal and RichDif for each pair
+    results[[paste(stations[i], stations[j], sep = ", ")]] <- c(JAC$part[4], JAC$part[5])  # JAC$part[4]: BDtotal, JAC$part[5]: RichDif
+  }
+}
+
+# Create a cross-tabulation matrix for easy readability of results
+results_matrix <- matrix(NA, nrow = length(stations), ncol = length(stations))
+rownames(results_matrix) <- stations
+colnames(results_matrix) <- stations
+
+# Fill the matrix with the computed values
+for (i in 1:length(stations)) {
+  for (j in 1:length(stations)) {
+    if (i < j) {
+      results_matrix[i, j] <- results[[paste(stations[i], stations[j], sep = ", ")]][1]  # BDtotal
+    } else if (i > j) {
+      results_matrix[i, j] <- results[[paste(stations[j], stations[i], sep = ", ")]][2]  # RichDif
+    }
+  }
+}
+
+# Convert the results matrix to a data frame for better readability
+results_df <- as.data.frame(results_matrix)
+
+# Round values to 2 decimal places and export to a CSV file
+write.csv(format(round(results_df, 2), nsmall = 2), file = "resultats_jaccard.csv", row.names = TRUE)
+
+# Print the final results table
+print(results_df)
+
+statnam<- c("Calvi_Autumn", "Calvi_Spring", "L.Île.Rousse_Autumn", "L.Île.Rousse_Spring", 
+              "Saint.Florent_Autumn", "Saint.Florent_Spring", "STARESO_Autumn", "STARESO_Spring")
+
+# Perform PCA on the PA matrix
+res.pca <- prcomp(PA_matrix)
+
+# Visualize PCA results
+RES.PCA <- fviz_pca_biplot(res.pca,
+                            habillage = statnam,
+                            labelsize = 3,
+                            repel = TRUE,
+                            legend.title = "Sample",
+                            title = NULL) + 
+           theme(text = element_text(size = 10))
+
+# Display the PCA plot
+RES.PCA
+```
+
+##Trophic levels - diagram
+```{r}
+# Assign a trophic category and convert NAs to "Unknown"
+adnei_with_traits <- adnei_with_traits %>% 
+  mutate(TrophicCategory = case_when(
+    FoodTroph >= 2.0 & FoodTroph < 2.19 ~ "Herbivore",
+    FoodTroph >= 2.2 & FoodTroph < 2.79 ~ "Omnivore",
+    FoodTroph >= 2.8 ~ "Carnivore",
+    TRUE ~ NA_character_  # Replace NAs with NA
+  ))
+
+# Restructure data to have stations in a single column
+adnei_long <- adnei_with_traits %>% 
+  pivot_longer(cols = 2:9, names_to = "Station", values_to = "Presence") %>% 
+  filter(Presence == 1)  # Filter for presence only
+
+# Add a column for the season
+adnei_long <- adnei_long %>% 
+  mutate(Season = ifelse(grepl("Spring", Station, ignore.case = TRUE), "Spring", "Autumn")) %>% 
+  # Remove everything after the underscore in the Station column
+  mutate(Station = sub("_.*$", "", Station)) %>% 
+  # Create a combined variable for station and season without duplicates
+  mutate(StationSeason = ifelse(Season == "Spring", 
+                                paste(Station, "Spring"), 
+                                paste(Station, "Autumn")))
+
+# Ensure facets are in the desired order
+adnei_long$StationSeason <- factor(adnei_long$StationSeason, 
+                                    levels = c("Calvi Spring", "Calvi Autumn", 
+                                               "L.Île.Rousse Spring", "L.Île.Rousse Autumn", 
+                                               "Saint.Florent Spring", "Saint.Florent Autumn", 
+                                               "STARESO Spring", "STARESO Autumn"))
+
+# Summarize data by station and trophic category
+trophic_summary <- adnei_long %>% 
+  group_by(StationSeason, TrophicCategory) %>% 
+  summarise(Count = n(), .groups = "drop") %>% 
+  filter(!is.na(TrophicCategory)) %>%  # Remove NA categories
+  group_by(StationSeason) %>% 
+  mutate(RelativeFreq = Count / sum(Count))  # Calculate relative frequency
+
+# Check summarized data
+print(trophic_summary)
+
+# Manually add TLmean values
+trophic_summary <- trophic_summary %>% 
+  mutate(TLmean = case_when(
+    StationSeason == "Calvi Spring" ~ "3.18 (± 0.40)",
+    StationSeason == "Calvi Autumn" ~ "3.38 (± 0.50)",
+    StationSeason == "L.Île.Rousse Spring" ~ "3.33 (± 0.50)",
+    StationSeason == "L.Île.Rousse Autumn" ~ "3.36 (± 0.53)",
+    StationSeason == "Saint.Florent Spring" ~ "3.17 (± 0.52)",
+    StationSeason == "Saint.Florent Autumn" ~ "3.05 (± 0.42)",
+    StationSeason == "STARESO Spring" ~ "3.23 (± 0.37)",
+    StationSeason == "STARESO Autumn" ~ "3.22 (± 0.46)",
+    TRUE ~ NA_character_
+  ))
+
+# Replace dots with spaces and "Autumn" with "Post-storm"
+trophic_summary <- trophic_summary %>% 
+  mutate(StationSeason = gsub("\\.", " ", StationSeason),  # Remove dots
+         StationSeason = gsub("Autumn", "Post-storm", StationSeason))  # Replace Autumn with Post-storm
+
+# Define the order of stations to ensure Spring is before Post-storm
+trophic_summary$StationSeason <- factor(trophic_summary$StationSeason, 
+                                         levels = c("Calvi Spring", "L Île Rousse Spring", "Saint Florent Spring", "STARESO Spring", 
+                                                    "Calvi Post-storm", "L Île Rousse Post-storm", "Saint Florent Post-storm", "STARESO Post-storm"))
+
+# Create a pie chart with TLmean (sd) values at the center
+ggplot(trophic_summary, aes(x = "", y = RelativeFreq, fill = TrophicCategory)) + 
+  geom_bar(stat = "identity", width = 1) + 
+  coord_polar("y") + 
+  facet_wrap(~ StationSeason, nrow = 2, ncol = 4) +  # Spring on the first row, Post-storm on the second
+  scale_fill_manual(values = c("Herbivore" = "#FF9999", "Omnivore" = "#FFCC99", "Carnivore" = "#99CCFF")) +  # Pastel color palette
+  labs(fill = "Trophic Category") + 
+  theme_void() +  # Display TLmean (sd) at the center of each circle
+  geom_text(aes(label = TLmean), x = 0, y = 0, color = "black", size = 3, inherit.aes = FALSE)  
+
+```
