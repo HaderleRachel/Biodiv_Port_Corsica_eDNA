@@ -257,7 +257,7 @@ adnei_with_traits$Invasive[is.na(adnei_with_traits$Invasive)] <- 0
 adnei_with_traits <- adnei_with_traits %>%
   mutate(
     IUCN_Red_List_Category_VU = ifelse(IUCN_status == "Vulnerable", 1, 0),
-    IUCN_Red_List_Category_EN = ifelse(IUCN_status == "Endangered", 2, 0),
+    IUCN_Red_List_Category_EN = ifelse(IUCN_status == "endangered species", 2, 0),
     IUCN_Red_List_Category_CR = ifelse(IUCN_status == "Critically Endangered", 3, 0)
   )
 
